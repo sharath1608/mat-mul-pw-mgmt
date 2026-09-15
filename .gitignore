@@ -6,5 +6,5 @@ main_original
 *.pdf
 *.json
 *.so
-!power-profile.csv
+!power-profile.*.csv
 !data.csv

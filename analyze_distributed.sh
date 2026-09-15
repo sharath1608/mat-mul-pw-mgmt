@@ -98,6 +98,239 @@ power_for_core() {
   fi
 }
 
+# ── Power measurement sources ────────────────────────────────────────────────
+#
+# power-profile.csv is the primary profile and produces the unqualified
+# analytics files, which every reader predating power-source selection treats as
+# IPMI. Any additional profile staged as power-profile.<type>.csv produces a
+# parallel set named <analysis>-analytics.<type>.json, fitted into
+# <analysis>.<type>.pkl.
+#
+# IPMI (whole chassis) and RAPL (CPU package) do not measure the same physical
+# quantity, so the two sets are kept wholly separate and the API serves one per
+# request. They are never merged or plotted together.
+#
+# Restricted to the sources Pulsar knows how to serve (see pulsar/PowerType.h);
+# a profile named anything else would generate files no client would ever ask
+# for.
+POWER_TYPES=(ipmi rapl)
+
+# The six analytics derived from the power profile. Time, space, speedup and
+# freeup do not vary with the power source and keep a single stored copy.
+POWER_DEPENDENT_ANALYTICS=(power-serial power-parallel energy-serial energy-parallel powerup energyup)
+
+# Sort a CSV by its last (numeric) column, keeping the header in place. Mirrors
+# what the primary pass does inline for each serial measurement file; the fitted
+# array is positional, so a variant CSV has to be ordered the same way.
+sort_by_last_column() {
+  local file=$1
+  local ncols
+  ncols=$(head -1 "$file" | awk -F',' '{print NF}')
+  (head -n 1 "$file" && tail -n +2 "$file" | sort -t',' -k"$ncols" -n) > "${file}.tmp" \
+    && mv "${file}.tmp" "$file"
+}
+
+# jo block for one variant analytics file, matching the field order and units the
+# primary pass writes.
+emit_variant_analytics() {
+  local out_file=$1
+  local iva_arg=$2
+  local name=$3
+  local unit=$4
+  local fitted_file=$5
+  shift 5
+  local values=("$@")
+
+  jo -p \
+  iva="$iva_arg" \
+  measurements=$(jo data=$(jo -a "${values[@]}") name="$name" unit="$unit") \
+  unoptimized=$(jo data=$(jo -a) name="$name" unit="$unit") \
+  fitted=$(jo data="`jq '.fitted' "$fitted_file"`" name="$name" unit="$unit") \
+  fit_method="`jq -r '.method' "$fitted_file"`" \
+  mse="`jq '.mse' "$fitted_file"`" \
+  > "$out_file"
+}
+
+# Remove any previously generated output for a power source, so a re-import that
+# no longer stages that profile does not leave a stale set behind for the API to
+# advertise.
+clean_power_variant() {
+  local variant_type=$1
+  local base
+
+  for base in "${POWER_DEPENDENT_ANALYTICS[@]}"; do
+    rm -f "${base}-analytics.${variant_type}.json" \
+          "${base}.${variant_type}.csv" \
+          "${base}.${variant_type}-fitted.json" \
+          "${base}.${variant_type}.pkl" \
+          "${base}.${variant_type}.png"
+  done
+}
+
+# Re-derive power, energy, power-up and green-up for one power source and write
+# them under power-source qualified names.
+derive_power_variant() {
+  local variant_profile_file=$1
+  local variant_type=$2
+  local suffix=".$variant_type"
+
+  echo "Deriving $variant_type power analytics from $variant_profile_file"
+
+  # Shadows the global; bash scopes dynamically, so power_for_core called from
+  # here reads this profile and the primary one is restored on return.
+  local -a power_profile=()
+  local pi pp_value
+  while IFS=, read -r pi pp_value; do
+    [[ -z "$pp_value" ]] && continue
+    power_profile+=("$pp_value")
+  done < "$variant_profile_file"
+
+  if (( ${#power_profile[@]} == 0 )); then
+    echo "Warning: $variant_profile_file holds no readable entries; skipping $variant_type" >&2
+    return 1
+  fi
+
+  local max_core=0 c
+  for c in "${core[@]}"; do
+    (( c > max_core )) && max_core=$c
+  done
+
+  # power_for_core silently falls back to the single-core value out of range,
+  # which would flatten the curve instead of failing. Refuse rather than publish
+  # a profile that looks measured but is not.
+  if (( max_core > ${#power_profile[@]} )); then
+    echo "Error: core count ($max_core) exceeds $variant_type power profile entries (${#power_profile[@]})" >&2
+    return 1
+  fi
+
+  local -a v_power_serial=() v_power_parallel=()
+  local -a v_energy_serial=() v_energy_parallel=()
+  local -a v_powerup=() v_energyup=()
+  local idx ts ps tp pp val
+
+  for ((idx=0; idx<${#iva[@]}; idx++)); do
+    v_power_serial+=("${power_profile[0]}")
+  done
+
+  for ((idx=0; idx<${#core[@]}; idx++)); do
+    v_power_parallel+=("$(power_for_core "${core[$idx]}")")
+  done
+
+  for ((idx=0; idx<${#time_serial[@]}; idx++)); do
+    ts=${time_serial[$idx]}
+    ps=$(value_or_default v_power_serial "$idx" "${power_profile[0]}")
+    v_energy_serial+=("$(printf "%.8f" "$(echo "$ts * $ps" | bc -l)")")
+  done
+
+  for ((idx=0; idx<${#time_parallel[@]}; idx++)); do
+    tp=${time_parallel[$idx]}
+    pp=$(value_or_default v_power_parallel "$idx" "$(power_for_core "${core[$idx]}")")
+    v_energy_parallel+=("$(printf "%.8f" "$(echo "$tp * $pp" | bc -l)")")
+  done
+
+  local base_power base_time base_energy
+  base_power=$(value_or_default v_power_parallel 0 "$(power_for_core "${core[0]}")")
+  for val in "${v_power_parallel[@]}"; do
+    v_powerup+=("$(printf "%.6f" "$(echo "$base_power / $val" | bc -l)")")
+  done
+
+  base_time=$(value_or_default time_parallel 0 "1")
+  base_energy=$(printf "%.8f" "$(echo "$base_time * $base_power" | bc -l)")
+  for val in "${v_energy_parallel[@]}"; do
+    v_energyup+=("$(printf "%.6f" "$(echo "$base_energy / $val" | bc -l)")")
+  done
+
+  # ── CSVs for the curve fitter ──────────────────────────────────────────────
+  local i
+
+  echo "$(IFS=,; echo "${input_var_names[*]}"),power" > "power-serial${suffix}.csv"
+  for i in "${!iva_arr[@]}"; do
+    echo "${iva_arr[$i]},${v_power_serial[$i]}" >> "power-serial${suffix}.csv"
+  done
+  sort_by_last_column "power-serial${suffix}.csv"
+
+  echo "core,power" > "power-parallel${suffix}.csv"
+  for i in "${!core[@]}"; do
+    echo "${core[$i]},${v_power_parallel[$i]}" >> "power-parallel${suffix}.csv"
+  done
+
+  echo "$(IFS=,; echo "${input_var_names[*]}"),energy" > "energy-serial${suffix}.csv"
+  for i in "${!iva_arr[@]}"; do
+    echo "${iva_arr[$i]},${v_energy_serial[$i]}" >> "energy-serial${suffix}.csv"
+  done
+  sort_by_last_column "energy-serial${suffix}.csv"
+
+  echo "core,energy" > "energy-parallel${suffix}.csv"
+  for i in "${!core[@]}"; do
+    echo "${core[$i]},${v_energy_parallel[$i]}" >> "energy-parallel${suffix}.csv"
+  done
+
+  echo "core,power" > "powerup${suffix}.csv"
+  for i in "${!core[@]}"; do
+    echo "${core[$i]},${v_powerup[$i]}" >> "powerup${suffix}.csv"
+  done
+
+  echo "core,energy" > "energyup${suffix}.csv"
+  for i in "${!core[@]}"; do
+    echo "${core[$i]},${v_energyup[$i]}" >> "energyup${suffix}.csv"
+  done
+
+  # ── Curve fits ─────────────────────────────────────────────────────────────
+  # Same split as the primary pass: power-parallel and powerup are the two that
+  # are allowed a non-polynomial fit.
+  local v_poly_only=(power-serial energy-serial energy-parallel energyup)
+  local v_allow_all=(power-parallel powerup)
+  local base
+
+  for base in "${v_poly_only[@]}"; do
+    call_fit "${base}${suffix}.csv" "${base}${suffix}-fitted.json" "$current_progress" \
+      "$progress_bandwidth" "$fit_count" "$id" "$repo" "$repo_name" "$start_time" \
+      "$analysis_file" "true"
+  done
+
+  for base in "${v_allow_all[@]}"; do
+    call_fit "${base}${suffix}.csv" "${base}${suffix}-fitted.json" "$current_progress" \
+      "$progress_bandwidth" "$fit_count" "$id" "$repo" "$repo_name" "$start_time" \
+      "$analysis_file"
+  done
+
+  for base in "${POWER_DEPENDENT_ANALYTICS[@]}"; do
+    if [[ ! -f "${base}${suffix}-fitted.json" ]]; then
+      echo "Error: curve fit produced no ${base}${suffix}-fitted.json; $variant_type incomplete" >&2
+      return 1
+    fi
+  done
+
+  # ── Analytics JSON ─────────────────────────────────────────────────────────
+  # The API treats a power source as available only when all six files exist, so
+  # a partial set here simply leaves the source unoffered rather than mixing it
+  # with the primary one.
+  local core_iva_json
+  core_iva_json="$(jo -a "$(jo data="$(jo -a ${core[@]})" name=core unit=count)")"
+
+  emit_variant_analytics "${power_serial_analytics_file%.json}${suffix}.json" \
+    "$iva_json" power "watts" "power-serial${suffix}-fitted.json" "${v_power_serial[@]}"
+
+  emit_variant_analytics "${power_parallel_analytics_file%.json}${suffix}.json" \
+    "$core_iva_json" power "watts" "power-parallel${suffix}-fitted.json" "${v_power_parallel[@]}"
+
+  emit_variant_analytics "${energy_serial_analytics_file%.json}${suffix}.json" \
+    "$iva_json" energy "watt-seconds" "energy-serial${suffix}-fitted.json" "${v_energy_serial[@]}"
+
+  emit_variant_analytics "${energy_parallel_analytics_file%.json}${suffix}.json" \
+    "$core_iva_json" energy "watt-seconds" "energy-parallel${suffix}-fitted.json" "${v_energy_parallel[@]}"
+
+  emit_variant_analytics "${powerup_analytics_file%.json}${suffix}.json" \
+    "$core_iva_json" 'PowerEfficiency(P1/Pcore)' '' "powerup${suffix}-fitted.json" "${v_powerup[@]}"
+
+  emit_variant_analytics "${energyup_analytics_file%.json}${suffix}.json" \
+    "$core_iva_json" 'EnergyEfficiency(E1/Ecore)' '' "energyup${suffix}-fitted.json" "${v_energyup[@]}"
+
+  echo "$variant_type power analytics written"
+  return 0
+}
+
+
 if [ "$#" -ne 32 ]; then
     echo "Invalid number of parameters. Expected:32 Passed:$#"
     usage
@@ -154,12 +387,19 @@ rm -f $time_serial_analytics_file $time_parallel_analytics_file $time_parallel_s
    $freeup_analytics_file $powerup_analytics_file $energyup_analytics_file \
    $serial_measurement $parallel_measurement $parallel_slow_measurement
 
+# Clear every power source's output, not just the primary one. A repo that had a
+# RAPL profile staged on a previous run and no longer does must not keep serving
+# the old RAPL curve.
+for _power_type in "${POWER_TYPES[@]}"; do
+  clean_power_variant "$_power_type"
+done
+
 echo "cleanup done"
 
 { IFS=, read -ra iva_arr_names; readarray -t iva_arr; } < $iva_data_file
 
-# Get physical core count lscpu
-core_count=$(lscpu -p=CORE,SOCKET 2>/dev/null| sort -u | grep -v '^[[:space:]]*$\|^[[:space:]]*#'| wc -l)
+# Get core count from output of nproc --all
+core_count=$(nproc)
 echo "Core count: $core_count"
 
 echo "read array files"
@@ -861,5 +1101,25 @@ fitted=$(jo data="`jq '.fitted' energyup-fitted.json`" name='EnergyEfficiency(E1
 fit_method="`jq -r '.method' energyup-fitted.json`" \
 mse="`jq '.mse' energyup-fitted.json`" \
 > $energyup_analytics_file_d
+
+# ── Additional power sources ─────────────────────────────────────────────────
+#
+# Runs after the primary analytics are on disk, and deliberately does not fail
+# the import: the primary source is already complete and valid, so a bad or
+# missing second profile should cost the user the extra graphs, not the run.
+for _power_type in "${POWER_TYPES[@]}"; do
+  _variant_profile="power-profile.${_power_type}.csv"
+
+  if [[ ! -f "$_variant_profile" ]]; then
+    continue
+  fi
+
+  if derive_power_variant "$_variant_profile" "$_power_type"; then
+    echo "Power source $_power_type available for $repo_name"
+  else
+    echo "Warning: could not derive $_power_type power analytics; continuing without it" >&2
+    clean_power_variant "$_power_type"
+  fi
+done
 
 echo "Analytics generation complete! Orion.cpp will finalize status."
