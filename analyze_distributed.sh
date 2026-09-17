@@ -180,7 +180,12 @@ derive_power_variant() {
   # here reads this profile and the primary one is restored on return.
   local -a power_profile=()
   local pi pp_value
-  while IFS=, read -r pi pp_value; do
+  # `|| [[ -n "$pi" ]]` keeps the final line when the file does not end in a
+  # newline. read returns non-zero on an unterminated last line even though it
+  # populated the variables, so without this the last core silently goes missing
+  # and the profile reads one entry short. Hand-staged profiles lose the trailing
+  # newline easily.
+  while IFS=, read -r pi pp_value || [[ -n "$pi" ]]; do
     [[ -z "$pp_value" ]] && continue
     power_profile+=("$pp_value")
   done < "$variant_profile_file"
@@ -195,11 +200,16 @@ derive_power_variant() {
     (( c > max_core )) && max_core=$c
   done
 
+  echo "  $variant_type profile: ${#power_profile[@]} entries parsed, max core $max_core"
+
   # power_for_core silently falls back to the single-core value out of range,
   # which would flatten the curve instead of failing. Refuse rather than publish
   # a profile that looks measured but is not.
   if (( max_core > ${#power_profile[@]} )); then
     echo "Error: core count ($max_core) exceeds $variant_type power profile entries (${#power_profile[@]})" >&2
+    echo "       $variant_profile_file needs one line per core, '<core>,<watts>'." >&2
+    echo "       It holds $(grep -c . "$variant_profile_file" 2>/dev/null) non-empty lines;" >&2
+    echo "       if that matches the core count, the file is missing its trailing newline." >&2
     return 1
   fi
 
@@ -406,9 +416,14 @@ echo "read array files"
 
 power_profile=()
 
-while IFS=, read -r i p;
+# `|| [[ -n "$i" ]]` keeps a final line that is not newline-terminated; without
+# it the top core's entry is dropped and power_for_core quietly substitutes the
+# single-core value for it.
+while IFS=, read -r i p || [[ -n "$i" ]];
 do power_profile+=($p);
 done < $power_profile_file
+
+echo "power profile: ${#power_profile[@]} entries from $power_profile_file"
 
 if (( core_count > ${#power_profile[@]} )); then
   echo "Error: core count ($core_count) exceeds power profile entries (${#power_profile[@]})" >&2
